@@ -35,36 +35,10 @@
 #define CLOCK_TIME_FORMAT     "%.2d:%.2d:%.2d"
 #define CLOCK_ISO_DATE_FORMAT "%.4d-%.2d-%.2d"
 
-const GpioPin* nss_1 = &gpio_ext_pc0;
-const GpioPin* reset_sx = &gpio_ext_pc1;
+#include "lora.h"
 const GpioPin* const pin_led = &gpio_swclk;
 const GpioPin* const pin_back = &gpio_button_back;
-
 #define TAG "LoRa"
-
-void abandone();
-int16_t getRSSI();
-int8_t getSNR();
-void configureRadioEssentials();
-bool begin();
-bool sanityCheck();
-void checkBusy();
-void setModeReceive();
-int lora_receive_async(uint8_t* buff, int buffMaxLen);
-bool configSetFrequency(long frequencyInHz);
-bool configSetBandwidth(int bw);
-bool configSetSpreadingFactor(int sf);
-bool configSetCodingRate(int cr);
-bool configSetSyncWord(uint8_t syncWord, uint8_t controlBits);
-void setPacketParams(
-    uint16_t packetParam1,
-    uint8_t packetParam2,
-    uint8_t packetParam3,
-    uint8_t packetParam4,
-    uint8_t packetParam5);
-
-void transmit(uint8_t* data, int dataLen);
-
 // Change this to BACKLIGHT_AUTO if you don't want the backlight to be continuously on.
 #define BACKLIGHT_ON 1
 
@@ -152,7 +126,9 @@ typedef struct {
     uint8_t packetPayloadLength;
     uint8_t packetCRC;
     uint8_t packetInvertIQ;
-
+    FuriThread* sniffer_thread;
+    bool sniffer_running;
+    FuriMutex* file_mutex;
 } LoRaApp;
 
 typedef struct {
@@ -188,8 +164,12 @@ typedef struct {
     DialogsApp* dialogs_rx;
     Storage* storage_rx;
     File* file_rx;
+    uint32_t packet_count;
+    char last_packet_preview[48];
+    int16_t last_rssi;
+    int8_t last_snr;
+    bool has_packet;
 } LoRaSnifferModel;
-
 typedef struct {
     uint32_t test;
     bool flag_tx_file;
@@ -290,12 +270,12 @@ static void lora_submenu_callback(void* context, uint32_t index) {
         view_dispatcher_switch_to_view(app->view_dispatcher, LoRaViewByteInput);
         break;
     case LoRaSubmenuIndexLinkerSubGHZ:
-        furi_hal_gpio_init_simple(nss_1, GpioModeOutputPushPull);
-        furi_hal_gpio_init_simple(reset_sx, GpioModeOutputPushPull);
+        furi_hal_gpio_init_simple(pin_nss1, GpioModeOutputPushPull);
+        furi_hal_gpio_init_simple(pin_reset, GpioModeOutputPushPull);
         furi_hal_gpio_init_simple(pin_led, GpioModeOutputPushPull);
 
-        furi_hal_gpio_write(nss_1, false);
-        furi_hal_gpio_write(reset_sx, false);
+        furi_hal_gpio_write(pin_nss1, false);
+        furi_hal_gpio_write(pin_reset, false);
 
         furi_hal_gpio_write(pin_led, true);
         furi_delay_ms(100);
@@ -1564,7 +1544,7 @@ static void lora_config_meshtastic_change(VariableItem* item) {
 */
 static const char* config_freq_config_label = "Frequency";
 static const char* config_freq_entry_text = "Enter frequency (MHz)";
-static const char* config_freq_default_value = "915.0";
+static const char* config_freq_default_value = "910.3";
 static void lora_config_freq_text_updated(void* context) {
     LoRaApp* app = (LoRaApp*)context;
     bool redraw = true;
@@ -1644,25 +1624,16 @@ static void lora_setting_item_clicked(void* context, uint32_t index) {
 
 // Open serial port USB (dual mode CDC)
 bool serial_open_port(void) {
-    if(furi_hal_usb_get_config() != &usb_cdc_dual) {
-        return furi_hal_usb_set_config(&usb_cdc_dual, NULL);
-    }
     return true;
 }
 
-// Close serial port (simple mode)
 bool serial_close_port(void) {
-    if(furi_hal_usb_get_config() == &usb_cdc_dual) {
-        return furi_hal_usb_set_config(&usb_cdc_single, NULL);
-    }
     return true;
 }
 
-// Send raw bytes
 void serial_send_bytes(const uint8_t* data, size_t len) {
-    if(len > 0) {
-        furi_hal_cdc_send(CDC_PORT_NUM, (uint8_t*)data, len);
-    }
+    UNUSED(data);
+    UNUSED(len);
 }
 
 uint8_t receiveBuff[255];
@@ -1692,129 +1663,153 @@ uint8_t mundo[] = " lo esencial :D";
  * @param      canvas  The canvas to draw on.
  * @param      model   The model - MyModel object.
 */
+static int32_t lora_sniffer_worker(void* context) {
+    LoRaApp* app = (LoRaApp*)context;
+    uint8_t rx_buf[256];
+    uint8_t* frame = (uint8_t*)malloc(512);
+    char* final_string = (char*)malloc(1024);
+
+    if(!frame || !final_string) {
+        FURI_LOG_E(TAG, "Failed to allocate sniffer worker buffers");
+        if(frame) free(frame);
+        if(final_string) free(final_string);
+        return -1;
+    }
+    uint32_t heartbeat_tick = 0;
+    FURI_LOG_I(TAG, "Sniffer worker thread started");
+
+    while(app->sniffer_running) {
+        int bytesRead = lora_receive_async(rx_buf, sizeof(rx_buf));
+        if(bytesRead > 0) {
+            bytesToAsciiHex(rx_buf, (uint8_t)bytesRead);
+
+            // Format USB CDC packet frame
+            uint16_t index = 0;
+            frame[index++] = '@';
+            frame[index++] = 'S';
+            frame[index++] = (uint8_t)((bytesRead >> 8) & 0xFF);
+            frame[index++] = (uint8_t)(bytesRead & 0xFF);
+            memcpy(&frame[index], rx_buf, bytesRead);
+            index += bytesRead;
+            int16_t pkt_rssi = getRSSI();
+            frame[index++] = (uint8_t)((pkt_rssi >> 8) & 0xFF);
+            frame[index++] = (uint8_t)(pkt_rssi & 0xFF);
+            int8_t pkt_snr = getSNR();
+            frame[index++] = (uint8_t)pkt_snr;
+            frame[index++] = '@';
+            frame[index++] = 'E';
+            frame[index++] = '\r';
+            frame[index++] = '\n';
+
+            for(uint16_t i = 0; i < index; i += 64) {
+                size_t chunk = (index - i > 64) ? 64 : (index - i);
+                serial_send_bytes(frame + i, chunk);
+                furi_delay_ms(2);
+            }
+
+            // Write to SD card if logging is enabled
+            if(furi_mutex_acquire(app->file_mutex, 100) == FuriStatusOk) {
+                LoRaSnifferModel* model = view_get_model(app->view_sniffer);
+                if(model && model->flag_file && model->file_rx) {
+                    DateTime curr_dt;
+                    furi_hal_rtc_get_datetime(&curr_dt);
+                    char time_string[TIME_LEN];
+                    char date_string[DATE_LEN];
+                    snprintf(
+                        time_string,
+                        TIME_LEN,
+                        CLOCK_TIME_FORMAT,
+                        curr_dt.hour,
+                        curr_dt.minute,
+                        curr_dt.second);
+                    snprintf(
+                        date_string,
+                        DATE_LEN,
+                        CLOCK_ISO_DATE_FORMAT,
+                        curr_dt.year,
+                        curr_dt.month,
+                        curr_dt.day);
+
+                    const char* freq_str = furi_string_get_cstr(model->config_freq_name);
+                    snprintf(
+                        final_string,
+                        1024,
+                        "{\"date\":\"%s\", \"time\":\"%s\", \"frequency\":\"%s\", \"bw\":\"%s\", \"sf\":\"%s\", \"RSSI\":\"%d\", \"payload\":\"%s\"}\n",
+                        date_string,
+                        time_string,
+                        freq_str,
+                        config_bw_names[model->config_bw_index],
+                        config_sf_names[model->config_sf_index],
+                        pkt_rssi,
+                        asciiBuff);
+                    storage_file_write(model->file_rx, final_string, strlen(final_string));
+                }
+                furi_mutex_release(app->file_mutex);
+            }
+
+            // Update UI model
+            with_view_model(
+                app->view_sniffer,
+                LoRaSnifferModel * model,
+                {
+                    model->packet_count++;
+                    model->last_rssi = pkt_rssi;
+                    model->last_snr = pkt_snr;
+                    model->has_packet = true;
+                    strncpy(model->last_packet_preview, asciiBuff, sizeof(model->last_packet_preview) - 1);
+                    model->last_packet_preview[sizeof(model->last_packet_preview) - 1] = '\0';
+                },
+                true);
+        } else {
+            heartbeat_tick++;
+            if(heartbeat_tick >= 300) {
+                heartbeat_tick = 0;
+                LoRaSnifferModel* model = view_get_model(app->view_sniffer);
+                const char* freq_str = model ? furi_string_get_cstr(model->config_freq_name) : "???";
+                FURI_LOG_I(
+                    TAG,
+                    "Sniffer listening... Freq: %s MHz, Packets: %lu, DIO1 pin: %d",
+                    freq_str,
+                    model ? (unsigned long)model->packet_count : 0,
+                    furi_hal_gpio_read(pin_dio1));
+            }
+            furi_delay_ms(10);
+        }
+    }
+
+    free(frame);
+    free(final_string);
+    return 0;
+}
+
 static void lora_view_sniffer_draw_callback(Canvas* canvas, void* model) {
     LoRaSnifferModel* my_model = (LoRaSnifferModel*)model;
 
-    bool flag_file = my_model->flag_file;
-
     canvas_draw_icon(canvas, 0, 17, &I_flippers_cat);
 
-    // Receive a packet over radio
-    int bytesRead = lora_receive_async(receiveBuff, sizeof(receiveBuff));
-
-    if(bytesRead > -1) {
-        FURI_LOG_E(TAG, "Packet received... ");
-        receiveBuff[bytesRead] = '\0';
-        bytesToAsciiHex(receiveBuff, bytesRead);
-
-        FURI_LOG_E(TAG, "bytesRead = %d", bytesRead);
-        FURI_LOG_E(TAG, "receiveBuff -> %s", receiveBuff);
-
-        uint8_t frame[512];
-        uint16_t index = 0;
-
-        // SOF
-        frame[index++] = '@';
-        frame[index++] = 'S';
-
-        // Packet length (bytesRead)
-        frame[index++] = (uint8_t)((bytesRead >> 8) & 0xFF); // high byte
-        frame[index++] = (uint8_t)(bytesRead & 0xFF); // low byte
-
-        // Payload
-        memcpy(&frame[index], receiveBuff, bytesRead);
-        index += bytesRead;
-
-        // RSSI
-        int16_t rssi = getRSSI();
-        frame[index++] = (uint8_t)((rssi >> 8) & 0xFF);
-        frame[index++] = (uint8_t)(rssi & 0xFF);
-
-        // SNR
-        int8_t snr = getSNR();
-        frame[index++] = (uint8_t)snr;
-
-        // EOF
-        frame[index++] = '@';
-        frame[index++] = 'E';
-        frame[index++] = '\r';
-        frame[index++] = '\n';
-
-        for(uint16_t i = 0; i < index; i += 64) {
-            size_t chunk = (index - i > 64) ? 64 : (index - i);
-            serial_send_bytes(frame + i, chunk);
-            furi_delay_ms(2);
-        }
-
-        if(flag_file) {
-            DateTime curr_dt;
-            furi_hal_rtc_get_datetime(&curr_dt);
-
-            char time_string[TIME_LEN];
-            char date_string[DATE_LEN];
-
-            snprintf(
-                time_string,
-                TIME_LEN,
-                CLOCK_TIME_FORMAT,
-                curr_dt.hour,
-                curr_dt.minute,
-                curr_dt.second);
-            snprintf(
-                date_string,
-                DATE_LEN,
-                CLOCK_ISO_DATE_FORMAT,
-                curr_dt.year,
-                curr_dt.month,
-                curr_dt.day);
-
-            char final_string[400];
-            const char* freq_str = furi_string_get_cstr(my_model->config_freq_name);
-
-            // JSON format
-            snprintf(
-                final_string,
-                666,
-                "{\"date\":\"%s\", \"time\":\"%s\", \"frequency\":\"%s\", \"bw\":\"%s\", \"sf\":\"%s\", \"RSSI\":\"%d\", \"payload\":\"%s\"}",
-                date_string,
-                time_string,
-                freq_str,
-                config_bw_names[my_model->config_bw_index],
-                config_sf_names[my_model->config_sf_index],
-                getRSSI(),
-                asciiBuff);
-
-            FURI_LOG_E(TAG, "TS: %s", final_string);
-            FURI_LOG_E(TAG, "Length: %d", strlen(final_string) + 1);
-
-            storage_file_write(my_model->file_rx, final_string, strlen(final_string));
-            storage_file_write(my_model->file_rx, "\n", 1);
-        }
-
-        FURI_LOG_E(TAG, "%s", asciiBuff); //receiveBuff);
+    if(my_model->flag_file) {
+        canvas_draw_icon(canvas, 110, 1, &I_write);
+        canvas_draw_str(canvas, 60, 20, "Recording...");
+    } else {
+        canvas_draw_icon(canvas, 110, 1, &I_no_write);
     }
 
     FuriString* xstr = furi_string_alloc();
 
-    if(flag_file) {
-        canvas_draw_icon(canvas, 110, 1, &I_write);
-        furi_string_printf(xstr, "Recording...");
-        canvas_draw_str(canvas, 60, 20, furi_string_get_cstr(xstr));
+    if(my_model->has_packet) {
+        furi_string_printf(
+            xstr,
+            "#%lu %s",
+            (unsigned long)my_model->packet_count,
+            my_model->last_packet_preview);
+        canvas_draw_str(canvas, 1, 10, furi_string_get_cstr(xstr));
+
+        furi_string_printf(xstr, "RSSI:%d SNR:%d", my_model->last_rssi, my_model->last_snr);
+        canvas_draw_str(canvas, 1, 19, furi_string_get_cstr(xstr));
     } else {
-        canvas_draw_icon(canvas, 110, 1, &I_no_write);
-        furi_string_printf(xstr, "            ");
-        canvas_draw_str(canvas, 60, 20, furi_string_get_cstr(xstr));
+        canvas_draw_str(canvas, 1, 10, "Sniffing LoRa...");
+        canvas_draw_str(canvas, 1, 19, "Waiting for packets");
     }
-
-    receiveBuff[17] = '.';
-    receiveBuff[18] = '.';
-    receiveBuff[19] = '.';
-    receiveBuff[20] = '\0';
-
-    canvas_draw_str(canvas, 1, 10, (const char*)receiveBuff);
-
-    furi_string_printf(xstr, "RSSI: %d  ", getRSSI());
-    canvas_draw_str(canvas, 1, 19, furi_string_get_cstr(xstr));
 
     furi_string_printf(xstr, "BW:%s", config_bw_names[my_model->config_bw_index]);
     canvas_draw_str(canvas, 1, 28, furi_string_get_cstr(xstr));
@@ -1877,7 +1872,38 @@ static void lora_view_transmitter_timer_callback(void* context) {
 static void lora_view_sniffer_enter_callback(void* context) {
     uint32_t period = furi_ms_to_ticks(1000);
     LoRaApp* app = (LoRaApp*)context;
-    furi_assert(app->timer_rx == NULL);
+
+    if(app->config_frequency < 150000000 || app->config_frequency > 960000000) {
+        app->config_frequency = 915000000;
+    }
+
+    // Apply active configuration before sniffing
+    configSetFrequency(app->config_frequency);
+    setPacketParams(
+        app->packetPreamble,
+        app->packetHeaderType,
+        0xFF,
+        app->packetCRC,
+        app->packetInvertIQ);
+    setModeReceive();
+
+    if(app->sniffer_thread != NULL) {
+        app->sniffer_running = false;
+        furi_thread_join(app->sniffer_thread);
+        furi_thread_free(app->sniffer_thread);
+        app->sniffer_thread = NULL;
+    }
+
+    app->sniffer_running = true;
+    app->sniffer_thread =
+        furi_thread_alloc_ex("LoRaSniffer", 4096, lora_sniffer_worker, app);
+    furi_thread_start(app->sniffer_thread);
+
+    if(app->timer_rx != NULL) {
+        furi_timer_stop(app->timer_rx);
+        furi_timer_free(app->timer_rx);
+        app->timer_rx = NULL;
+    }
     app->timer_rx =
         furi_timer_alloc(lora_view_sniffer_timer_callback, FuriTimerTypePeriodic, context);
     furi_timer_start(app->timer_rx, period);
@@ -1892,7 +1918,12 @@ static void lora_view_sniffer_enter_callback(void* context) {
 static void lora_view_transmitter_enter_callback(void* context) {
     uint32_t period = furi_ms_to_ticks(1000);
     LoRaApp* app = (LoRaApp*)context;
-    furi_assert(app->timer_tx == NULL);
+
+    if(app->timer_tx != NULL) {
+        furi_timer_stop(app->timer_tx);
+        furi_timer_free(app->timer_tx);
+        app->timer_tx = NULL;
+    }
     app->timer_tx =
         furi_timer_alloc(lora_view_transmitter_timer_callback, FuriTimerTypePeriodic, context);
     furi_timer_start(app->timer_tx, period);
@@ -1905,10 +1936,31 @@ static void lora_view_transmitter_enter_callback(void* context) {
 */
 static void lora_view_sniffer_exit_callback(void* context) {
     LoRaApp* app = (LoRaApp*)context;
-    furi_timer_stop(app->timer_rx);
-    furi_timer_free(app->timer_rx);
-    app->timer_rx = NULL;
-    FURI_LOG_E(TAG, "Stop timer rx");
+
+    if(app->sniffer_thread) {
+        app->sniffer_running = false;
+        furi_thread_join(app->sniffer_thread);
+        furi_thread_free(app->sniffer_thread);
+        app->sniffer_thread = NULL;
+    }
+
+    if(app->timer_rx) {
+        furi_timer_stop(app->timer_rx);
+        furi_timer_free(app->timer_rx);
+        app->timer_rx = NULL;
+    }
+
+    // Safely close file if open
+    LoRaSnifferModel* model = view_get_model(app->view_sniffer);
+    if(model->flag_file) {
+        if(furi_mutex_acquire(app->file_mutex, FuriWaitForever) == FuriStatusOk) {
+            model->flag_file = false;
+            storage_file_close(model->file_rx);
+            furi_mutex_release(app->file_mutex);
+        }
+    }
+
+    setModeStandby();
 }
 
 /**
@@ -2040,42 +2092,35 @@ static bool lora_view_sniffer_input_callback(InputEvent* event, void* context) {
             // handle our LoRaEventIdOkPressed event.  We could have just put the code from
             // lora_custom_event_callback here, it's a matter of preference.
 
-            bool redraw = true;
-            with_view_model(
-                app->view_sniffer,
-                LoRaSnifferModel * model,
-                {
-                    // Start/Stop recording
-                    model->flag_file = !model->flag_file;
+            if(furi_mutex_acquire(app->file_mutex, FuriWaitForever) == FuriStatusOk) {
+                with_view_model(
+                    app->view_sniffer,
+                    LoRaSnifferModel * model,
+                    {
+                        // Start/Stop recording
+                        model->flag_file = !model->flag_file;
 
-                    if(model->flag_file) {
-                        // if(!storage_simply_mkdir(model->storage_rx, PATHAPPEXT)) {
-                        //     FURI_LOG_E(TAG, "Failed to create directory %s", PATHAPPEXT);
-                        //     return;
-                        // }
+                        if(model->flag_file) {
+                            char filename[256];
+                            int file_index = 0;
 
-                        char filename[256];
-                        int file_index = 0;
+                            do {
+                                snprintf(filename, sizeof(filename), PATHLORA, file_index);
+                                file_index++;
+                            } while(storage_file_exists(model->storage_rx, filename));
 
-                        do {
-                            snprintf(filename, sizeof(filename), PATHLORA, file_index);
-                            file_index++;
-                        } while(storage_file_exists(model->storage_rx, filename));
-
-                        if(!storage_file_open(
-                               model->file_rx, filename, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-                            FURI_LOG_E(TAG, "Failed to open file %s", filename);
-                            return 0;
+                            if(!storage_file_open(
+                                   model->file_rx, filename, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+                                FURI_LOG_E(TAG, "Failed to open file %s", filename);
+                                model->flag_file = false;
+                            }
+                        } else {
+                            storage_file_close(model->file_rx);
                         }
-                        FURI_LOG_E(TAG, "OPEN FILE ");
-
-                    } else {
-                        storage_file_close(model->file_rx);
-                        FURI_LOG_E(TAG, "CLOSE FILE ");
-                    }
-                },
-                redraw);
-
+                    },
+                    true);
+                furi_mutex_release(app->file_mutex);
+            }
             view_dispatcher_send_custom_event(app->view_dispatcher, LoRaEventIdOkPressed);
             return true;
         }
@@ -2252,6 +2297,8 @@ static LoRaApp* lora_app_alloc() {
     UNUSED(config_eu_dr_label);
 
     LoRaApp* app = (LoRaApp*)malloc(sizeof(LoRaApp));
+    memset(app, 0, sizeof(LoRaApp));
+    app->config_frequency = 910300000;
     VariableItem* item;
     Gui* gui = furi_record_open(RECORD_GUI);
 
@@ -2370,7 +2417,7 @@ static LoRaApp* lora_app_alloc() {
         COUNT_OF(config_sw_values),
         lora_config_sw_change,
         app);
-    uint8_t config_sw_index = 0;
+    uint8_t config_sw_index = 1; // Default to Public (0x34) for YoLink / LoRaWAN
     variable_item_set_current_value_index(app->item_sw, config_sw_index);
     variable_item_set_current_value_text(app->item_sw, config_sw_names[config_sw_index]);
 
@@ -2565,7 +2612,11 @@ static LoRaApp* lora_app_alloc() {
     model_s->config_meshtastic_index = config_meshtastic_index;
 
     model_s->x = 0;
-
+    model_s->packet_count = 0;
+    model_s->has_packet = false;
+    model_s->last_packet_preview[0] = '\0';
+    model_s->last_rssi = 0;
+    model_s->last_snr = 0;
     model_s->dialogs_rx = furi_record_open(RECORD_DIALOGS);
     model_s->storage_rx = furi_record_open(RECORD_STORAGE);
     model_s->file_rx = storage_file_alloc(model_s->storage_rx);
@@ -2615,6 +2666,7 @@ static LoRaApp* lora_app_alloc() {
     notification_message(app->notifications, &sequence_display_backlight_enforce_on);
 #endif
 
+    app->file_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     return app;
 }
 
@@ -2667,6 +2719,7 @@ static void lora_app_free(LoRaApp* app) {
 
     serial_close_port(); // USB normal
 
+    furi_mutex_free(app->file_mutex);
     free(app);
 }
 
@@ -2680,16 +2733,7 @@ static void lora_app_free(LoRaApp* app) {
 int32_t main_lora_app(void* _p) {
     UNUSED(_p);
 
-    static FuriHalSpiBusHandle spi_handle;
-    const FuriHalSpiBusHandle* spi;
-
-    memcpy(&spi_handle, &furi_hal_spi_bus_handle_external, sizeof(FuriHalSpiBusHandle));
-    spi_handle.cs = &gpio_ext_pc0;
-    spi = &spi_handle;
-
-    furi_hal_spi_bus_handle_init(spi);
-
-    abandone();
+    furi_log_set_level(FuriLogLevelTrace);
 
     if(!begin()) {
         DialogsApp* dialogs_msg = furi_record_open(RECORD_DIALOGS);
@@ -2704,29 +2748,25 @@ int32_t main_lora_app(void* _p) {
         dialog_message_show(dialogs_msg, message);
         dialog_message_free(message);
         furi_record_close(RECORD_DIALOGS);
+        lora_deinit();
         return 0;
     }
 
     LoRaApp* app = lora_app_alloc();
 
-    app->packetPreamble = 0x0010;
+    app->packetPreamble = 0x0008;
     app->packetHeaderType = 0x00;
     app->packetPayloadLength = 0xFF;
-    app->packetCRC = 0x00;
+    app->packetCRC = 0x01;
     app->packetInvertIQ = 0x00;
+
+    // Immediately launch into Sniffer screen
+    view_dispatcher_switch_to_view(app->view_dispatcher, LoRaViewSniffer);
 
     view_dispatcher_run(app->view_dispatcher);
 
     lora_app_free(app);
-
-    furi_hal_spi_bus_handle_deinit(spi);
-
-    memcpy(&spi_handle, &furi_hal_spi_bus_handle_external, sizeof(FuriHalSpiBusHandle));
-    spi_handle.cs = &gpio_ext_pa4;
-    spi = &spi_handle;
-
-    // Typically when a pin is no longer in use, it is set to analog mode.
-    furi_hal_gpio_init_simple(pin_led, GpioModeAnalog);
+    lora_deinit();
 
     return 0;
 }
