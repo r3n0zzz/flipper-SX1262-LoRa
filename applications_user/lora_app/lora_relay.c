@@ -2183,21 +2183,41 @@ void send_data(void* context) {
     LoRaApp* app = (LoRaApp*)context;
     LoRaTransmitterModel* model = view_get_model(app->view_transmitter);
 
-    //uint8_t transmitBuff[64];
     FuriString* predefined_filepath = furi_string_alloc_set_str(PATHAPPEXT);
     FuriString* selected_filepath = furi_string_alloc();
     DialogsFileBrowserOptions browser_options;
     dialog_file_browser_set_basic_options(&browser_options, LORA_LOG_FILE_EXTENSION, NULL);
     browser_options.base_path = PATHAPPEXT;
 
-    dialog_file_browser_show(
+    bool file_selected = dialog_file_browser_show(
         model->dialogs_tx, selected_filepath, predefined_filepath, &browser_options);
+
+    if(!file_selected || furi_string_empty(selected_filepath)) {
+        furi_string_free(selected_filepath);
+        furi_string_free(predefined_filepath);
+        return;
+    }
+
+    const char* path_cstr = furi_string_get_cstr(selected_filepath);
+    FURI_LOG_I(TAG, "Replaying from log: %s", path_cstr);
 
     if(storage_file_open(
            model->file_tx,
-           furi_string_get_cstr(selected_filepath),
+           path_cstr,
            FSAM_READ,
            FSOM_OPEN_EXISTING)) {
+        uint64_t file_size = storage_file_size(model->file_tx);
+        if(file_size == 0) {
+            storage_file_close(model->file_tx);
+            furi_string_free(selected_filepath);
+            furi_string_free(predefined_filepath);
+            DialogMessage* msg = dialog_message_alloc();
+            dialog_message_set_text(msg, "File is empty!\nNo packets to replay", 0, 0, AlignLeft, AlignTop);
+            dialog_message_show(model->dialogs_tx, msg);
+            dialog_message_free(msg);
+            return;
+        }
+
         model->flag_tx_file = true;
         model->test = 1;
 
@@ -2205,30 +2225,35 @@ void send_data(void* context) {
         size_t buffer_index = 0;
         size_t bytes_read;
         char c;
+        uint32_t count = 0;
 
         while((bytes_read = storage_file_read(model->file_tx, &c, 1)) > 0 && model->flag_signal) {
             if(c == '\n' || buffer_index >= 256 - 1) {
                 buffer[buffer_index] = '\0';
-
-                FURI_LOG_E(TAG, "%s\n", buffer);
-
-                tx_payload(buffer);
+                if(strlen(buffer) > 0) {
+                    FURI_LOG_I(TAG, "Replaying: %s", buffer);
+                    tx_payload(buffer);
+                    count++;
+                }
                 buffer_index = 0;
             } else {
                 buffer[buffer_index++] = c;
             }
         }
 
+        storage_file_close(model->file_tx);
+        FURI_LOG_I(TAG, "Replayed %lu packets from file", (unsigned long)count);
     } else {
+        FURI_LOG_E(TAG, "Cannot open file: %s", path_cstr);
         dialog_message_show_storage_error(model->dialogs_tx, "Cannot open File");
     }
-    storage_file_close(model->file_tx);
+
     model->test = 0;
     furi_string_free(selected_filepath);
     furi_string_free(predefined_filepath);
 
     furi_hal_gpio_write(pin_led, true);
-    furi_delay_ms(50);
+    furi_delay_ms(100);
     furi_hal_gpio_write(pin_led, false);
 
     model->flag_tx_file = false;
