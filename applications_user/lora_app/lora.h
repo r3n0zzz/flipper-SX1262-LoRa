@@ -17,6 +17,7 @@ extern const GpioPin* const pin_dio1;
 
 bool begin(void);
 void lora_deinit(void);
+void lora_deinit_for_linker(void);
 bool sanityCheck(void);
 void checkBusy(void);
 void configureRadioEssentials(void);

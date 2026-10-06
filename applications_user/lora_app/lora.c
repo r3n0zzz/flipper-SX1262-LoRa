@@ -528,6 +528,7 @@ void transmit(uint8_t* data, int dataLen) {
     waitForRadioCommandCompletion(100);
 
     // 4. SetTx
+    furi_hal_gpio_write(pin_beacon, true);
     checkBusy();
     furi_hal_spi_acquire(spi);
     spiBuff[0] = 0x83; // SetTx
@@ -538,6 +539,8 @@ void transmit(uint8_t* data, int dataLen) {
     furi_hal_spi_release(spi);
 
     waitForRadioCommandCompletion(transmitTimeout);
+    furi_hal_gpio_write(pin_beacon, false);
+    FURI_LOG_I(TAG, "TX complete: %d bytes", dataLen);
 
     // Return to safe standby
     rf_switch_off();
@@ -729,6 +732,25 @@ void lora_deinit() {
 
     // Safely return all pins to Analog mode
     furi_hal_gpio_init_simple(pin_reset, GpioModeAnalog);
+    furi_hal_gpio_init_simple(pin_nss0, GpioModeAnalog);
+    furi_hal_gpio_init_simple(pin_beacon, GpioModeAnalog);
+    furi_hal_gpio_init_simple(pin_ant_sw, GpioModeAnalog);
+    furi_hal_gpio_init_simple(pin_dio22, GpioModeAnalog);
+    furi_hal_gpio_init_simple(pin_dio1, GpioModeAnalog);
+    furi_hal_gpio_init_simple(pin_busy, GpioModeAnalog);
+}
+
+void lora_deinit_for_linker() {
+    setModeStandby();
+    deinit_spi();
+
+    // Keep SX1262 held in RESET and CS deselected (HIGH)
+    furi_hal_gpio_init_simple(pin_reset, GpioModeOutputPushPull);
+    furi_hal_gpio_write(pin_reset, false);
+    furi_hal_gpio_init_simple(pin_nss1, GpioModeOutputPushPull);
+    furi_hal_gpio_write(pin_nss1, true);
+
+    // Release CC1101 CS and other pins to Analog for firmware Sub-GHz app
     furi_hal_gpio_init_simple(pin_nss0, GpioModeAnalog);
     furi_hal_gpio_init_simple(pin_beacon, GpioModeAnalog);
     furi_hal_gpio_init_simple(pin_ant_sw, GpioModeAnalog);

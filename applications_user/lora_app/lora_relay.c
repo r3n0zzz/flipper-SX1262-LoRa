@@ -129,6 +129,7 @@ typedef struct {
     FuriThread* sniffer_thread;
     bool sniffer_running;
     FuriMutex* file_mutex;
+    bool is_linker_subghz;
 } LoRaApp;
 
 typedef struct {
@@ -270,11 +271,12 @@ static void lora_submenu_callback(void* context, uint32_t index) {
         view_dispatcher_switch_to_view(app->view_dispatcher, LoRaViewByteInput);
         break;
     case LoRaSubmenuIndexLinkerSubGHZ:
+        app->is_linker_subghz = true;
         furi_hal_gpio_init_simple(pin_nss1, GpioModeOutputPushPull);
         furi_hal_gpio_init_simple(pin_reset, GpioModeOutputPushPull);
         furi_hal_gpio_init_simple(pin_led, GpioModeOutputPushPull);
 
-        furi_hal_gpio_write(pin_nss1, false);
+        furi_hal_gpio_write(pin_nss1, true);
         furi_hal_gpio_write(pin_reset, false);
 
         furi_hal_gpio_write(pin_led, true);
@@ -1223,8 +1225,11 @@ static void lora_config_region_change(VariableItem* item) {
 
     variable_item_list_reset(app->variable_item_list_lorawan);
 
-    char text_buf[11] = {0};
+    configSetSyncWord(0x34, 0x44);
+    app->packetPreamble = 8;
+    setPacketParams(8, app->packetHeaderType, app->packetPayloadLength, 1, app->packetInvertIQ);
 
+    char text_buf[11] = {0};
     if(index == 0) {
         app->config_frequency = 868100000;
         // setting text for configure frequency
@@ -1486,6 +1491,17 @@ static void lora_config_meshtastic_change(VariableItem* item) {
     default:
         return;
     }
+    app->config_frequency = 906875000;
+    configSetFrequency(app->config_frequency);
+    char mesh_freq_buf[16] = {0};
+    snprintf(
+        mesh_freq_buf,
+        sizeof(mesh_freq_buf),
+        "%3lu.%1lu MHz",
+        app->config_frequency / 1000000,
+        (app->config_frequency % 1000000) / 100000);
+    furi_string_set(model->config_freq_name, mesh_freq_buf);
+    variable_item_set_current_value_text(app->config_freq_item, mesh_freq_buf);
 
     // Apply configuration to hardware
     configSetBandwidth(config_bw_values[bw_index]);
@@ -1568,9 +1584,8 @@ static void lora_config_freq_text_updated(void* context) {
 
 static void set_value(void* context) {
     LoRaApp* app = (LoRaApp*)context;
-
-    FURI_LOG_E(TAG, "Byte buffer: %s", (char*)app->byte_buffer);
     view_dispatcher_switch_to_view(app->view_dispatcher, LoRaViewSubmenu);
+    FURI_LOG_I(TAG, "Manual TX: %lu bytes", (unsigned long)app->byte_buffer_size);
     transmit(app->byte_buffer, app->byte_buffer_size);
 }
 
@@ -1648,9 +1663,16 @@ void bytesToAsciiHex(uint8_t* buffer, uint8_t length) {
     asciiBuff[length * 2] = '\0'; // Null-terminate the string
 }
 
+static inline uint8_t hex_char_to_val(char c) {
+    if(c >= '0' && c <= '9') return c - '0';
+    if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
 void asciiHexToBytes(const char* hex, uint8_t* bytes, size_t length) {
     for(size_t i = 0; i < length; i++) {
-        sscanf(hex + 2 * i, "%02hhx", &bytes[i]);
+        bytes[i] = (hex_char_to_val(hex[2 * i]) << 4) | hex_char_to_val(hex[2 * i + 1]);
     }
 }
 
@@ -2162,11 +2184,11 @@ void send_data(void* context) {
     LoRaTransmitterModel* model = view_get_model(app->view_transmitter);
 
     //uint8_t transmitBuff[64];
-    FuriString* predefined_filepath = furi_string_alloc_set_str(PATHAPP);
+    FuriString* predefined_filepath = furi_string_alloc_set_str(PATHAPPEXT);
     FuriString* selected_filepath = furi_string_alloc();
     DialogsFileBrowserOptions browser_options;
     dialog_file_browser_set_basic_options(&browser_options, LORA_LOG_FILE_EXTENSION, NULL);
-    browser_options.base_path = PATHAPP;
+    browser_options.base_path = PATHAPPEXT;
 
     dialog_file_browser_show(
         model->dialogs_tx, selected_filepath, predefined_filepath, &browser_options);
@@ -2765,8 +2787,12 @@ int32_t main_lora_app(void* _p) {
 
     view_dispatcher_run(app->view_dispatcher);
 
+    bool is_linker = app->is_linker_subghz;
     lora_app_free(app);
-    lora_deinit();
-
+    if(is_linker) {
+        lora_deinit_for_linker();
+    } else {
+        lora_deinit();
+    }
     return 0;
 }
